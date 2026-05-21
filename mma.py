@@ -995,7 +995,7 @@ def magic(filename, xi_filename, options):
 				sfz_loop_end = int(region.sfz_params['loop_end'])
 				if sfz_loop_end > sfz_loop_start:
 					loop_start = sfz_loop_start
-					loop_length = sfz_loop_end - sfz_loop_start
+					loop_length = sfz_loop_end - sfz_loop_start + 1
 					loop_type_flag = SAMPLE_TYPE_FWD_LOOP
 			except ValueError:
 				pass
