@@ -188,7 +188,7 @@ def write_delta_sample(sample_path, fp):
 
 	frames = []
 	while True:
-		r = sample.readframes(512)
+		r = sample.readframes(4096)
 		if not r:
 			break
 
@@ -724,13 +724,12 @@ def magic(filename, xi_filename, options):
 	# The sfz standard also has a Delay time before the Attack, and a Hold time between Attack and Decay.
 
 	# seconds-to-ticks converter
-	# Why 50?
 	stt = 50
 
-	# volume envelope
-	volume_ticks = 0
+	# volume envelope (accumulated in seconds for precision)
+	volume_seconds = 0.0
 	volume_level = 0
-	volume_envelope_ticks = []
+	volume_envelope_seconds = []
 	volume_envelope_level = []
 	vol_sustain_point = None
 
@@ -738,77 +737,94 @@ def magic(filename, xi_filename, options):
 	region = regions[0]
 
 	if 'ampeg_start' in region.sfz_params:
-		volume_level = int((float(region.sfz_params['ampeg_start']) * 0x40) / 100)
+		# Prevent negative values and out-of-bounds: clamp between 0.0% and 100.0%
+		raw_start = float(region.sfz_params['ampeg_start'])
+		clamped_start = max(0.0, min(100.0, raw_start))
+		volume_level = int((clamped_start * 0x40) / 100)
 
 	if 'ampeg_delay' in region.sfz_params:
-		volume_envelope_ticks.append(volume_ticks)
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
 
-		volume_ticks += int(float(region.sfz_params['ampeg_delay']) * stt)
+		volume_seconds += float(region.sfz_params['ampeg_delay'])
 
 	if 'ampeg_attack' in region.sfz_params:
-		volume_envelope_ticks.append(volume_ticks)
-		volume_envelope_level.append(volume_level)
-
-		volume_ticks += int(float(region.sfz_params['ampeg_attack']) * stt)
-	elif volume_envelope_ticks:
-		# If there already is a volume envelope, this is considered an attack time of 0
-		volume_envelope_ticks.append(volume_ticks)
+		attack_time = float(region.sfz_params['ampeg_attack'])
+		if attack_time > 0.001:
+			volume_envelope_seconds.append(volume_seconds)
+			volume_envelope_level.append(volume_level)
+			volume_seconds += attack_time
+		elif volume_envelope_seconds:
+			volume_envelope_seconds.append(volume_seconds)
+			volume_envelope_level.append(volume_level)
+	elif volume_envelope_seconds:
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
 
 	# After the attack time, the volume level is at its maximum value
 	volume_level = 0x40
 
 	if 'ampeg_hold' in region.sfz_params:
-		volume_envelope_ticks.append(volume_ticks)
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
 
-		volume_ticks += int(float(region.sfz_params['ampeg_hold']) * stt)
-	elif volume_envelope_ticks:
+		volume_seconds += float(region.sfz_params['ampeg_hold'])
+	elif volume_envelope_seconds:
 		# If there already is a volume envelope, this is considered a hold time of 0
-		volume_envelope_ticks.append(volume_ticks)
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
 
 	if 'ampeg_decay' in region.sfz_params:
-		volume_envelope_ticks.append(volume_ticks)
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
 
-		volume_ticks += int(float(region.sfz_params['ampeg_decay']) * stt)
-	elif volume_envelope_ticks:
+		volume_seconds += float(region.sfz_params['ampeg_decay'])
+	elif volume_envelope_seconds:
 		# If there already is a volume envelope, this is considered a decay time of 0
-		volume_envelope_ticks.append(volume_ticks)
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
 
 	# After the decay time, the volume level is at the sustain level
 	if 'ampeg_sustain' in region.sfz_params:
-		volume_level = int((float(region.sfz_params['ampeg_sustain']) * 0x40) / 100)
+		if not volume_envelope_seconds:
+			# If the envelope has not been created yet, set the first point for the attack
+			volume_envelope_seconds.append(0.0)
+			volume_envelope_level.append(volume_level)
+		# Prevent negative values and out-of-bounds: clamp between 0.0% and 100.0%
+		raw_sustain = float(region.sfz_params['ampeg_sustain'])
+		clamped_sustain = max(0.0, min(100.0, raw_sustain))
+		volume_level = int((clamped_sustain * 0x40) / 100)
 
-	if volume_envelope_ticks:
-		volume_envelope_ticks.append(volume_ticks)
+	if volume_envelope_seconds:
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
-		vol_sustain_point = len(volume_envelope_ticks) - 1
+		vol_sustain_point = len(volume_envelope_seconds) - 1
 
 	if 'ampeg_release' in region.sfz_params:
-		volume_ticks += int(float(region.sfz_params['ampeg_release']) * stt)
-		if volume_envelope_ticks:
+		volume_seconds += float(region.sfz_params['ampeg_release'])
+		if volume_envelope_seconds:
 			# After the sustain, the volume level is at its minimum value
-			volume_envelope_ticks.append(volume_ticks)
+			volume_envelope_seconds.append(volume_seconds)
 			volume_envelope_level.append(0)
 		else:
 			# If the envelope has not been created yet, set the first point for the sustain
-			volume_envelope_ticks.append(0)
+			volume_envelope_seconds.append(0.0)
 			volume_envelope_level.append(volume_level)
-			vol_sustain_point = len(volume_envelope_ticks) - 1
+			vol_sustain_point = len(volume_envelope_seconds) - 1
 
 			# and then set the release point
-			volume_envelope_ticks.append(volume_ticks)
+			volume_envelope_seconds.append(volume_seconds)
 			volume_envelope_level.append(0)
-	elif volume_envelope_ticks:
+	elif volume_envelope_seconds:
 		# If there already is a volume envelope, this is considered a release time of 0
-		volume_envelope_ticks.append(volume_ticks)
+		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(0)
 
-	# Remove duplicate values from the envelope
+	# Convert seconds to ticks
+	volume_ticks = int(volume_seconds * stt)
+	volume_envelope_ticks = [int(s * stt) for s in volume_envelope_seconds]
+
+	# Remove exact duplicates (same tick AND same level)
 	last_ticks = None
 	last_level = None
 	delete_envelope = []
@@ -818,8 +834,7 @@ def magic(filename, xi_filename, options):
 		if (ticks == last_ticks) and (level == last_level):
 			delete_envelope.insert(0, i)
 
-			# Since we are deleting a point before the sustain point, the sustain point must be decremented
-			if i <= vol_sustain_point:
+			if vol_sustain_point is not None and i <= vol_sustain_point:
 				delete_sustain += 1
 
 		last_ticks = ticks
@@ -841,7 +856,11 @@ def magic(filename, xi_filename, options):
 		print('Too long envelope:', volume_ticks, 'ticks, shrinked to {}'.format(options.max_envelope_length))
 		print('/' * 80)
 
-	# TO DO -- Can the Pitch LFO parameters be used to compile the vibrato values?
+	# Guarantee at least 1 tick between consecutive points.
+	# Covers same-tick cases from int conversion and normalization collapse.
+	for i in range(1, len(volume_envelope_ticks)):
+		if volume_envelope_ticks[i] <= volume_envelope_ticks[i - 1]:
+			volume_envelope_ticks[i] = volume_envelope_ticks[i - 1] + 1
 
 	# -------------------------------------------------------------- inst header
 
@@ -896,17 +915,48 @@ def magic(filename, xi_filename, options):
 	# Panning type;  b0=on, b1=sustain, b2=loop
 	fp.write(struct.pack('<B', 0))
 
+	# --------------------------------------------------------------
+	# NEW: Pitch LFO to Vibrato Conversion
+	vib_type = 0
+	vib_sweep = 0
+	vib_depth = 0
+	vib_rate = 0
+
+	# Use the first region's settings for the instrument's global vibrato
+	region = regions[0] 
+
+	if 'pitchlfo_depth' in region.sfz_params or 'pitchlfo_freq' in region.sfz_params:
+		# 1. Depth: SFZ uses cents (100 cents = 1 semitone).
+		# In FT2, a depth of 16 is roughly 1 semitone. (Ratio: 16 / 100 = 0.16)
+		sfz_depth = float(region.sfz_params.get('pitchlfo_depth', 0))
+		vib_depth = int(sfz_depth * 0.16)
+		vib_depth = max(0, min(255, vib_depth))
+
+		# 2. Rate: SFZ uses Hz.
+		# A standard 5Hz vibrato maps to roughly 32 in FT2. (Ratio: 32 / 5 = 6.4)
+		sfz_freq = float(region.sfz_params.get('pitchlfo_freq', 0))
+		vib_rate = int(sfz_freq * 6.4)
+		vib_rate = max(0, min(255, vib_rate))
+
+		# 3. Sweep (Fade-in): SFZ uses seconds.
+		# In FT2, smaller sweep values mean slower fade-in. 
+		# (Rough approximation: 1 second = 40)
+		sfz_fade = float(region.sfz_params.get('pitchlfo_fade', 0))
+		vib_sweep = int(sfz_fade * 40)
+		vib_sweep = max(0, min(255, vib_sweep))
+
 	# Vibrato type
-	fp.write(struct.pack('<B', 0))
+	fp.write(struct.pack('<B', vib_type))
 
 	# Vibrato sweep
-	fp.write(struct.pack('<B', 0))
+	fp.write(struct.pack('<B', vib_sweep))
 
 	# Vibrato depth
-	fp.write(struct.pack('<B', 0))
+	fp.write(struct.pack('<B', vib_depth))
 
 	# Vibrato rate
-	fp.write(struct.pack('<B', 0))
+	fp.write(struct.pack('<B', vib_rate))
+	# --------------------------------------------------------------
 
 	# Volume fadeout (0..fff)
 	fp.write(struct.pack('<H', 0))
@@ -929,30 +979,67 @@ def magic(filename, xi_filename, options):
 
 		# ---------------------------------------------------------- sample headers
 
+		byte_multiplier = region.wav_params['sample_bittype'] * region.wav_params['channels']
+		
 		# Sample Length
-		fp.write(struct.pack('<I', region.wav_params['sample_length'] * region.wav_params['sample_bittype'] * region.wav_params['channels']))
+		fp.write(struct.pack('<I', region.wav_params['sample_length'] * byte_multiplier))
 
-		# Sample loop start
-		fp.write(struct.pack('<I', 0))
+		# ------------- NEW LOOP PARSER -------------
+		loop_start = 0
+		loop_length = 0
+		loop_type_flag = 0 
 
-		# Sample loop length
-		fp.write(struct.pack('<I', 0))
+		if 'loop_start' in region.sfz_params and 'loop_end' in region.sfz_params:
+			try:
+				sfz_loop_start = int(region.sfz_params['loop_start'])
+				sfz_loop_end = int(region.sfz_params['loop_end'])
+				if sfz_loop_end > sfz_loop_start:
+					loop_start = sfz_loop_start
+					loop_length = sfz_loop_end - sfz_loop_start
+					loop_type_flag = SAMPLE_TYPE_FWD_LOOP
+			except ValueError:
+				pass
+
+		if 'loop_mode' in region.sfz_params:
+			mode = region.sfz_params['loop_mode'].lower()
+			if mode in ['no_loop', 'one_shot']:
+				loop_type_flag = 0
+			elif mode in ['loop_continuous', 'loop_sustain']:
+				loop_type_flag = SAMPLE_TYPE_FWD_LOOP
+			elif mode == 'ping_pong':
+				loop_type_flag = SAMPLE_TYPE_BIDI_LOOP
+
+		if loop_length <= 0:
+			loop_type_flag = 0
+			loop_start = 0
+			loop_length = 0
+
+		# Sample loop start (in bytes)
+		fp.write(struct.pack('<I', loop_start * byte_multiplier))
+		# Sample loop length (in bytes)
+		fp.write(struct.pack('<I', loop_length * byte_multiplier))
+		# -----------------------------------------
 
 		# Volume
 		if 'volume' in region.sfz_params:
-			fp.write(struct.pack('<B', int(255 * math.exp(float(region.sfz_params['volume']) / 10) / math.exp(0.6))))	# 'cause volume is in dB
+			calc_vol = int(255 * math.exp(float(region.sfz_params['volume']) / 10) / math.exp(0.6))	# 'cause volume is in dB
+			calc_vol = max(0, min(255, calc_vol))
+			fp.write(struct.pack('<B', calc_vol))
 		else:
 			fp.write(struct.pack('<B', 255))
 
 		# Finetune (signed)
 		fp.write(struct.pack('<b', finetune + int(region.sfz_params['tune'])))
 
-		# Sample Type
-		fp.write(struct.pack('<B', region.wav_params['sample_type']))
+		# Sample Type (Combine original bits with loop bits)
+		final_sample_type = region.wav_params['sample_type'] | loop_type_flag
+		fp.write(struct.pack('<B', final_sample_type))
 
 		# Panning (unsigned)
 		if 'pan' in region.sfz_params:
-			fp.write(struct.pack('<B', int(((float(region.sfz_params['pan']) + 100) * 255) / 200)))
+			pan_calc = int(((float(region.sfz_params['pan']) + 100) * 255) / 200)
+			pan_calc = max(0, min(255, pan_calc))
+			fp.write(struct.pack('<B', pan_calc))
 		else:
 			fp.write(struct.pack('<B', 128))
 
@@ -988,7 +1075,7 @@ def main(argv):
 	parser.add_argument('-f', '--force', help='force reconversion', action='store_true')
 	parser.add_argument('-d', '--output-dir', help='set output directory')
 	parser.add_argument('-m', '--max-samples', help='set maximum number of samples (default: 16)', type=int, default=16)
-	parser.add_argument('-e', '--max-envelope-length', help='set maximum envelope length in ticks (default: 512)', type=int, default=512)
+	parser.add_argument('-e', '--max-envelope-length', help='set maximum envelope length in ticks (default: 324)', type=int, default=324)
 	parser.add_argument('-s', '--enable-stereo', help='enable support for stereo samples', action='store_true')
 	parser.add_argument('-4', '--enable-32-bit', help='enable support for 32-bit samples', action='store_true')
 	parser.add_argument('-r', '--drumset', help='the specified sfz files are drumsets', action='store_true')
@@ -1056,4 +1143,3 @@ def main(argv):
 
 if __name__ == '__main__':
 	sys.exit(main(sys.argv))
-
