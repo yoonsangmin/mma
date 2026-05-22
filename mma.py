@@ -580,6 +580,31 @@ def magic(filename, xi_filename, options):
 
 	regions = parse_sfz(filename, options)
 
+	# If a region is part of an L/R stereo pair, clear its pan so it
+	# defaults to center (128). Whichever side survives the overlap
+	# deletion will then play centered instead of hard left/right.
+	for region_l in regions:
+		try:
+			pan_l = float(region_l.sfz_params.get('pan', 0))
+		except (ValueError, TypeError):
+			pan_l = 0.0
+		if pan_l > -50:
+			continue
+		for region_r in regions:
+			if region_r is region_l:
+				continue
+			try:
+				pan_r = float(region_r.sfz_params.get('pan', 0))
+			except (ValueError, TypeError):
+				pan_r = 0.0
+			if pan_r < 50:
+				continue
+			if (region_l.sfz_params['lokey'] == region_r.sfz_params['lokey'] and
+				region_l.sfz_params['hikey'] == region_r.sfz_params['hikey']):
+				region_l.sfz_params.pop('pan', None)
+				region_r.sfz_params.pop('pan', None)
+				break
+
 	# The regions are sorted by lokey, and by the inverse of hikey, in order to have the regions
 	# that span the wider range of notes first
 	regions.sort(key=lambda x: [x.sfz_params['lokey'], -(x.sfz_params['hikey'])])
