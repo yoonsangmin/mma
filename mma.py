@@ -820,57 +820,60 @@ def magic(filename, xi_filename, options):
 		clamped_sustain = max(0.0, min(100.0, raw_sustain))
 		volume_level = int((clamped_sustain * 0x40) / 100)
 
+	# Sustain point: envelope holds here while key is pressed.
 	if volume_envelope_seconds:
 		volume_envelope_seconds.append(volume_seconds)
 		volume_envelope_level.append(volume_level)
 		vol_sustain_point = len(volume_envelope_seconds) - 1
 
+	# Release is handled via XI fadeout, not an envelope segment.
+	volume_fadeout = 0xFFF
+	release_seconds = 0
+	
 	if 'ampeg_release' in region.sfz_params:
-		volume_seconds += float(region.sfz_params['ampeg_release'])
-		if volume_envelope_seconds:
-			# After the sustain, the volume level is at its minimum value
-			volume_envelope_seconds.append(volume_seconds)
-			volume_envelope_level.append(0)
-		else:
+		release_seconds = float(region.sfz_params['ampeg_release'])
+		if not volume_envelope_seconds:
 			# If the envelope has not been created yet, set the first point for the sustain
 			volume_envelope_seconds.append(0.0)
 			volume_envelope_level.append(volume_level)
 			vol_sustain_point = len(volume_envelope_seconds) - 1
 
-			# and then set the release point
+	release_ticks = max(release_seconds * stt, 1)
+	fadeout_needed = 32768.0 / release_ticks
+	if fadeout_needed > 0xFFF:
+		# Too short for fadeout alone: max fadeout + envelope release segment
+		volume_fadeout = 0xFFF
+		if volume_envelope_seconds:
+			volume_seconds += release_seconds
 			volume_envelope_seconds.append(volume_seconds)
 			volume_envelope_level.append(0)
-	elif volume_envelope_seconds:
-		# If there already is a volume envelope, this is considered a release time of 0
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(0)
+	else:
+		volume_fadeout = max(1, int(fadeout_needed))
 
-	# Convert seconds to ticks
-	volume_ticks = int(volume_seconds * stt)
-	volume_envelope_ticks = [int(s * stt) for s in volume_envelope_seconds]
-
-	# Remove exact duplicates (same tick AND same level)
-	last_ticks = None
+	# Remove exact duplicates (same seconds AND same level) before tick conversion
+	last_seconds = None
 	last_level = None
 	delete_envelope = []
 	delete_sustain = 0
-	for (i, ticks) in enumerate(volume_envelope_ticks):
+	for (i, seconds) in enumerate(volume_envelope_seconds):
 		level = volume_envelope_level[i]
-		if (ticks == last_ticks) and (level == last_level):
+		if (seconds == last_seconds) and (level == last_level):
 			delete_envelope.insert(0, i)
-
 			if vol_sustain_point is not None and i <= vol_sustain_point:
 				delete_sustain += 1
-
-		last_ticks = ticks
+		last_seconds = seconds
 		last_level = level
 
 	for i in delete_envelope:
-		del volume_envelope_ticks[i]
+		del volume_envelope_seconds[i]
 		del volume_envelope_level[i]
 
 	if vol_sustain_point is not None:
 		vol_sustain_point -= delete_sustain
+
+	# Convert seconds to ticks
+	volume_ticks = int(volume_seconds * stt)
+	volume_envelope_ticks = [int(s * stt) for s in volume_envelope_seconds]
 
 	# Adjust the envelope ticks to not exceed the maximum envelope length
 	if volume_ticks > options.max_envelope_length:
@@ -881,11 +884,17 @@ def magic(filename, xi_filename, options):
 		print('Too long envelope:', volume_ticks, 'ticks, shrinked to {}'.format(options.max_envelope_length))
 		print('/' * 80)
 
-	# Guarantee at least 1 tick between consecutive points.
-	# Covers same-tick cases from int conversion and normalization collapse.
+	# Forward pass: guarantee at least 1 tick between consecutive points
 	for i in range(1, len(volume_envelope_ticks)):
 		if volume_envelope_ticks[i] <= volume_envelope_ticks[i - 1]:
 			volume_envelope_ticks[i] = volume_envelope_ticks[i - 1] + 1
+
+	# Backward pass: if forward pass pushed points beyond the limit, cap and pull back
+	if volume_envelope_ticks and volume_envelope_ticks[-1] > options.max_envelope_length:
+		volume_envelope_ticks[-1] = options.max_envelope_length
+		for i in range(len(volume_envelope_ticks) - 2, -1, -1):
+			if volume_envelope_ticks[i] >= volume_envelope_ticks[i + 1]:
+				volume_envelope_ticks[i] = volume_envelope_ticks[i + 1] - 1
 
 	# -------------------------------------------------------------- inst header
 
@@ -984,7 +993,7 @@ def magic(filename, xi_filename, options):
 	# --------------------------------------------------------------
 
 	# Volume fadeout (0..fff)
-	fp.write(struct.pack('<H', 0))
+	fp.write(struct.pack('<H', volume_fadeout))
 
 	# ????? (Zeroes or extened info for PsyTexx (vol,finetune,pan,relative,flags))
 	fp.write(struct.pack('<22B', *([0] * 22)))
