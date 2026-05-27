@@ -572,6 +572,25 @@ def parse_sfz(filename, options):
 	return regions
 
 
+
+def choose_representative_region(regions):
+	"""Choose the region whose key range best represents the whole XI instrument.
+
+	XI has one instrument-wide envelope/vibrato, so prefer the region that
+	contains C4. If none contains C4, use the region whose range center is
+	closest to C4.
+	"""
+	for region in regions:
+		if region.sfz_params['lokey'] <= XI_REL_NOTE_ZERO <= region.sfz_params['hikey']:
+			return region
+
+	return min(
+		regions,
+		key=lambda region: abs(
+			((region.sfz_params['lokey'] + region.sfz_params['hikey']) / 2.0) - XI_REL_NOTE_ZERO
+		)
+	)
+
 def magic(filename, xi_filename, options):
 	start = timeit.default_timer()
 
@@ -812,8 +831,8 @@ def _write_xi_instrument(regions, xi_filename, inst_name, options, start):
 	volume_fadeout = 0
 
 	if not options.drumset:
-		# Use the first region to generate the envelope
-		region = regions[0]
+		# Use the C4 region, or the region closest to C4, for the instrument-wide envelope.
+		region = choose_representative_region(regions)
 
 		if 'ampeg_start' in region.sfz_params:
 			# Prevent negative values and out-of-bounds: clamp between 0.0% and 100.0%
@@ -890,7 +909,7 @@ def _write_xi_instrument(regions, xi_filename, inst_name, options, start):
 
 			if not volume_envelope_seconds:
 				# If release is the only envelope parameter, create a sustain point so the
-				# instrument has a volume envelope for XI fadeout to act on.
+				# instrument has a volume envelope for XI fadeout/release handling.
 				volume_envelope_seconds.append(0.0)
 				volume_envelope_level.append(volume_level)
 				vol_sustain_point = len(volume_envelope_seconds) - 1
@@ -1013,8 +1032,8 @@ def _write_xi_instrument(regions, xi_filename, inst_name, options, start):
 	vib_depth = 0
 	vib_rate = 0
 
-	# Use the first region's settings for the instrument's global vibrato
-	region = regions[0] 
+	# Use the same representative region for the instrument's global vibrato.
+	region = choose_representative_region(regions)
 
 	if 'pitchlfo_depth' in region.sfz_params or 'pitchlfo_freq' in region.sfz_params:
 		# 1. Depth: SFZ uses cents (100 cents = 1 semitone).
