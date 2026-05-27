@@ -640,25 +640,38 @@ def magic(filename, xi_filename, options):
 		return
 
 	if len(regions) > options.max_samples:
-		# Keep only the maximum allowed number of regions, but we are keeping them evenly spaced, in order
-		# to support the widest possible range of notes
 		if options.drumset:
-			# For drumsets we keep only the first samples
-			keep_regions = list(range(options.max_samples))
+			# Split into multiple XI files, each holding up to max_samples regions.
+			# All samples are preserved across the split files.
+			chunks = [regions[i:i + options.max_samples]
+			          for i in range(0, len(regions), options.max_samples)]
+			base, xi_ext = os.path.splitext(xi_filename)
+			multi = len(chunks) > 1
+			for chunk_idx, chunk in enumerate(chunks):
+				chunk_xi = '{}_{}{}'.format(base, chunk_idx + 1, xi_ext) if multi else xi_filename
+				print('Writing chunk {}/{}: {}'.format(chunk_idx + 1, len(chunks), os.path.basename(chunk_xi)))
+				_write_xi_instrument(chunk, chunk_xi, root, options, start)
+			return
 		else:
+			# Keep only the maximum allowed number of regions, but we are keeping them evenly spaced, in order
+			# to support the widest possible range of notes
 			# For normal instruments we evenly distribute samples
 			keep_regions = get_n_indices(options.max_samples, len(regions))
 
-		exclude_regions = [regions[i].sfz_params['sample'] for i in range(len(regions)) if i not in keep_regions]
-		regions = [regions[i] for i in keep_regions]
+			exclude_regions = [regions[i].sfz_params['sample'] for i in range(len(regions)) if i not in keep_regions]
+			regions = [regions[i] for i in keep_regions]
 
-		print('/' * 80)
-		print('Too many samples in file:', tail, '(no more than {} samples supported)'.format(options.max_samples))
-		print('Skipping:')
-		pprint.pprint(exclude_regions)
-		print('/' * 80)
+			print('/' * 80)
+			print('Too many samples in file:', tail, '(no more than {} samples supported)'.format(options.max_samples))
+			print('Skipping:')
+			pprint.pprint(exclude_regions)
+			print('/' * 80)
 
-	notes_samples = [0] * 96
+	_write_xi_instrument(regions, xi_filename, root, options, start)
+
+
+def _write_xi_instrument(regions, xi_filename, inst_name, options, start):
+	notes_samples = [-1] * 96
 
 	if not options.drumset:
 		# Extend the first and last regions in order to have all the notes covered
@@ -698,33 +711,67 @@ def magic(filename, xi_filename, options):
 
 		last_region = region
 
-	# Map the samples to the corresponding notes
-	overlapping = set()
-	ignored = set()
-	for (i, region) in enumerate(regions):
-		lo = region.sfz_params['lokey']
-		hi = region.sfz_params['hikey']
-		for note in range(lo, hi + 1):
-			xi_note = note - XI_FIRST_NOTE
-			if (xi_note >= 0) and (xi_note < len(notes_samples)):
-				if notes_samples[xi_note]:
-					overlapping.add(note)
+	# Map samples to notes
+	has_mapped_note = False
+	if options.drumset:
+		# Evenly spread samples across the full 96-note range.
+		# Remember each sample's assigned center note too. In drumset mode we
+		# deliberately ignore the original SFZ key ranges, so using the original
+		# pitch_keycenter later would transpose many drums by a large amount.
+		n = len(regions)
+		drum_note_ranges = [[None, None] for _ in regions]
+		for xi_note in range(96):
+			sample_index = min(int(xi_note * n / 96), n - 1)
+			notes_samples[xi_note] = sample_index
+			has_mapped_note = True
+			if drum_note_ranges[sample_index][0] is None:
+				drum_note_ranges[sample_index][0] = xi_note
+			drum_note_ranges[sample_index][1] = xi_note
+
+		for (i, note_range) in enumerate(drum_note_ranges):
+			lo, hi = note_range
+			if lo is not None:
+				# The middle key of the assigned range plays the sample at its
+				# original pitch; keys around it intentionally transpose it.
+				regions[i].sfz_params['_xi_pitch_keycenter'] = XI_FIRST_NOTE + int((lo + hi) / 2)
+	else:
+		overlapping = set()
+		ignored = set()
+		for (i, region) in enumerate(regions):
+			lo = region.sfz_params['lokey']
+			hi = region.sfz_params['hikey']
+			for note in range(lo, hi + 1):
+				xi_note = note - XI_FIRST_NOTE
+				if (xi_note >= 0) and (xi_note < len(notes_samples)):
+					if notes_samples[xi_note] != -1:
+						overlapping.add(note)
+					else:
+						notes_samples[xi_note] = i
+						has_mapped_note = True
 				else:
-					notes_samples[xi_note] = i
-			else:
-				ignored.add(note)
+					ignored.add(note)
 
-	if overlapping:
-		print('/' * 80)
-		print('Notice: some regions are overlapping and would be overwritten')
-		pprint.pprint([NOTES[x] for x in sorted(overlapping)])
-		print('/' * 80)
+		if overlapping:
+			print('/' * 80)
+			print('Notice: some regions are overlapping and would be overwritten')
+			pprint.pprint([NOTES[x] for x in sorted(overlapping)])
+			print('/' * 80)
 
-	if ignored:
-		print('/' * 80)
-		print('Notice: some notes are out of range and ignored')
-		pprint.pprint([NOTES[x] for x in sorted(ignored)])
-		print('/' * 80)
+		if ignored:
+			print('/' * 80)
+			print('Notice: some notes are out of range and ignored')
+			pprint.pprint([NOTES[x] for x in sorted(ignored)])
+			print('/' * 80)
+
+	# Skip writing if no notes were mapped (e.g. all regions out of XI note range)
+	if not has_mapped_note:
+		print('No notes mapped, skipping:', os.path.basename(xi_filename))
+		return
+
+	# XI requires every note slot to contain a sample number. For notes that
+	# were not covered in normal instrument mode, keep the old behavior and
+	# point them to sample 0.
+	notes_samples = [0 if sample_index < 0 else sample_index for sample_index in notes_samples]
 
 	# create xi file
 	temp_filename = ''.join([xi_filename, '.temp'])
@@ -733,7 +780,7 @@ def magic(filename, xi_filename, options):
 	# -------------------------------------------------------------- file header
 	fp.write(struct.pack('<21s22sB20sH',
 		'Extended Instrument: ',
-		pad_name(root, 22),
+		pad_name(inst_name, 22),
 		0x1A,
 		pad_name(VERSION, 20),
 		xi_version
@@ -756,145 +803,155 @@ def magic(filename, xi_filename, options):
 	volume_level = 0
 	volume_envelope_seconds = []
 	volume_envelope_level = []
+	volume_envelope_ticks = []
 	vol_sustain_point = None
 
-	# Use the first region to generate the envelope
-	region = regions[0]
+	# Drumset mode should behave like one-shot samples: do not parse SFZ volume
+	# envelope/release settings at all. This keeps drum hits from being shortened by
+	# an instrument-level XI envelope or fadeout.
+	volume_fadeout = 0
 
-	if 'ampeg_start' in region.sfz_params:
-		# Prevent negative values and out-of-bounds: clamp between 0.0% and 100.0%
-		raw_start = float(region.sfz_params['ampeg_start'])
-		clamped_start = max(0.0, min(100.0, raw_start))
-		volume_level = int((clamped_start * 0x40) / 100)
+	if not options.drumset:
+		# Use the first region to generate the envelope
+		region = regions[0]
 
-	if 'ampeg_delay' in region.sfz_params:
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(volume_level)
+		if 'ampeg_start' in region.sfz_params:
+			# Prevent negative values and out-of-bounds: clamp between 0.0% and 100.0%
+			raw_start = float(region.sfz_params['ampeg_start'])
+			clamped_start = max(0.0, min(100.0, raw_start))
+			volume_level = int((clamped_start * 0x40) / 100)
 
-		volume_seconds += float(region.sfz_params['ampeg_delay'])
-
-	if 'ampeg_attack' in region.sfz_params:
-		attack_time = float(region.sfz_params['ampeg_attack'])
-		if attack_time > 0.001:
+		if 'ampeg_delay' in region.sfz_params:
 			volume_envelope_seconds.append(volume_seconds)
 			volume_envelope_level.append(volume_level)
-			volume_seconds += attack_time
+
+			volume_seconds += float(region.sfz_params['ampeg_delay'])
+
+		if 'ampeg_attack' in region.sfz_params:
+			attack_time = float(region.sfz_params['ampeg_attack'])
+			if attack_time > 0.001:
+				volume_envelope_seconds.append(volume_seconds)
+				volume_envelope_level.append(volume_level)
+				volume_seconds += attack_time
+			elif volume_envelope_seconds:
+				volume_envelope_seconds.append(volume_seconds)
+				volume_envelope_level.append(volume_level)
 		elif volume_envelope_seconds:
 			volume_envelope_seconds.append(volume_seconds)
 			volume_envelope_level.append(volume_level)
-	elif volume_envelope_seconds:
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(volume_level)
 
-	# After the attack time, the volume level is at its maximum value
-	volume_level = 0x40
+		# After the attack time, the volume level is at its maximum value
+		volume_level = 0x40
 
-	if 'ampeg_hold' in region.sfz_params:
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(volume_level)
-
-		volume_seconds += float(region.sfz_params['ampeg_hold'])
-	elif volume_envelope_seconds:
-		# If there already is a volume envelope, this is considered a hold time of 0
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(volume_level)
-
-	if 'ampeg_decay' in region.sfz_params:
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(volume_level)
-
-		volume_seconds += float(region.sfz_params['ampeg_decay'])
-	elif volume_envelope_seconds:
-		# If there already is a volume envelope, this is considered a decay time of 0
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(volume_level)
-
-	# After the decay time, the volume level is at the sustain level
-	if 'ampeg_sustain' in region.sfz_params:
-		if not volume_envelope_seconds:
-			# If the envelope has not been created yet, set the first point for the attack
-			volume_envelope_seconds.append(0.0)
+		if 'ampeg_hold' in region.sfz_params:
+			volume_envelope_seconds.append(volume_seconds)
 			volume_envelope_level.append(volume_level)
-		# Prevent negative values and out-of-bounds: clamp between 0.0% and 100.0%
-		raw_sustain = float(region.sfz_params['ampeg_sustain'])
-		clamped_sustain = max(0.0, min(100.0, raw_sustain))
-		volume_level = int((clamped_sustain * 0x40) / 100)
 
-	# Sustain point: envelope holds here while key is pressed.
-	if volume_envelope_seconds:
-		volume_envelope_seconds.append(volume_seconds)
-		volume_envelope_level.append(volume_level)
-		vol_sustain_point = len(volume_envelope_seconds) - 1
+			volume_seconds += float(region.sfz_params['ampeg_hold'])
+		elif volume_envelope_seconds:
+			# If there already is a volume envelope, this is considered a hold time of 0
+			volume_envelope_seconds.append(volume_seconds)
+			volume_envelope_level.append(volume_level)
 
-	# Release is handled via XI fadeout, not an envelope segment.
-	volume_fadeout = 0xFFF
-	release_seconds = 0
-	
-	if 'ampeg_release' in region.sfz_params:
-		release_seconds = float(region.sfz_params['ampeg_release'])
-		if not volume_envelope_seconds:
-			# If the envelope has not been created yet, set the first point for the sustain
-			volume_envelope_seconds.append(0.0)
+		if 'ampeg_decay' in region.sfz_params:
+			volume_envelope_seconds.append(volume_seconds)
+			volume_envelope_level.append(volume_level)
+
+			volume_seconds += float(region.sfz_params['ampeg_decay'])
+		elif volume_envelope_seconds:
+			# If there already is a volume envelope, this is considered a decay time of 0
+			volume_envelope_seconds.append(volume_seconds)
+			volume_envelope_level.append(volume_level)
+
+		# After the decay time, the volume level is at the sustain level
+		if 'ampeg_sustain' in region.sfz_params:
+			if not volume_envelope_seconds:
+				# If the envelope has not been created yet, set the first point for the attack
+				volume_envelope_seconds.append(0.0)
+				volume_envelope_level.append(volume_level)
+			# Prevent negative values and out-of-bounds: clamp between 0.0% and 100.0%
+			raw_sustain = float(region.sfz_params['ampeg_sustain'])
+			clamped_sustain = max(0.0, min(100.0, raw_sustain))
+			volume_level = int((clamped_sustain * 0x40) / 100)
+
+		# Sustain point: envelope holds here while key is pressed.
+		if volume_envelope_seconds:
+			volume_envelope_seconds.append(volume_seconds)
 			volume_envelope_level.append(volume_level)
 			vol_sustain_point = len(volume_envelope_seconds) - 1
 
-	release_ticks = max(release_seconds * stt, 1)
-	fadeout_needed = 32768.0 / release_ticks
-	if fadeout_needed > 0xFFF:
-		# Too short for fadeout alone: max fadeout + envelope release segment
-		volume_fadeout = 0xFFF
+		# Release is handled via XI fadeout, not a normal envelope segment.
+		# If needed, add a final 0-volume point for very short releases.
+		# Without a volume envelope or release, leave fadeout at 0.
+		release_seconds = 0.0
+
+		if 'ampeg_release' in region.sfz_params:
+			release_seconds = max(0.0, float(region.sfz_params['ampeg_release']))
+
+			if not volume_envelope_seconds:
+				# If release is the only envelope parameter, create a sustain point so the
+				# instrument has a volume envelope for XI fadeout to act on.
+				volume_envelope_seconds.append(0.0)
+				volume_envelope_level.append(volume_level)
+				vol_sustain_point = len(volume_envelope_seconds) - 1
+
 		if volume_envelope_seconds:
-			volume_seconds += release_seconds
-			volume_envelope_seconds.append(volume_seconds)
-			volume_envelope_level.append(0)
-	else:
-		volume_fadeout = max(1, int(fadeout_needed))
+			release_ticks = max(release_seconds * stt, 1)
+			fadeout_needed = 32768.0 / release_ticks
+			if fadeout_needed > 0xFFF:
+				# Too short for fadeout alone: max fadeout + envelope release segment
+				volume_fadeout = 0xFFF
+				volume_seconds += release_seconds
+				volume_envelope_seconds.append(volume_seconds)
+				volume_envelope_level.append(0)
+			else:
+				volume_fadeout = max(1, int(fadeout_needed))
 
-	# Remove exact duplicates (same seconds AND same level) before tick conversion
-	last_seconds = None
-	last_level = None
-	delete_envelope = []
-	delete_sustain = 0
-	for (i, seconds) in enumerate(volume_envelope_seconds):
-		level = volume_envelope_level[i]
-		if (seconds == last_seconds) and (level == last_level):
-			delete_envelope.insert(0, i)
-			if vol_sustain_point is not None and i <= vol_sustain_point:
-				delete_sustain += 1
-		last_seconds = seconds
-		last_level = level
+		# Remove exact duplicates (same seconds AND same level) before tick conversion
+		last_seconds = None
+		last_level = None
+		delete_envelope = []
+		delete_sustain = 0
+		for (i, seconds) in enumerate(volume_envelope_seconds):
+			level = volume_envelope_level[i]
+			if (seconds == last_seconds) and (level == last_level):
+				delete_envelope.insert(0, i)
+				if vol_sustain_point is not None and i <= vol_sustain_point:
+					delete_sustain += 1
+			last_seconds = seconds
+			last_level = level
 
-	for i in delete_envelope:
-		del volume_envelope_seconds[i]
-		del volume_envelope_level[i]
+		for i in delete_envelope:
+			del volume_envelope_seconds[i]
+			del volume_envelope_level[i]
 
-	if vol_sustain_point is not None:
-		vol_sustain_point -= delete_sustain
+		if vol_sustain_point is not None:
+			vol_sustain_point -= delete_sustain
 
-	# Convert seconds to ticks
-	volume_ticks = int(volume_seconds * stt)
-	volume_envelope_ticks = [int(s * stt) for s in volume_envelope_seconds]
+		# Convert seconds to ticks
+		volume_ticks = int(volume_seconds * stt)
+		volume_envelope_ticks = [int(s * stt) for s in volume_envelope_seconds]
 
-	# Adjust the envelope ticks to not exceed the maximum envelope length
-	if volume_ticks > options.max_envelope_length:
-		for (i, ticks) in enumerate(volume_envelope_ticks):
-			volume_envelope_ticks[i] = int((ticks * options.max_envelope_length) / volume_ticks)
+		# Adjust the envelope ticks to not exceed the maximum envelope length
+		if volume_ticks > options.max_envelope_length:
+			for (i, ticks) in enumerate(volume_envelope_ticks):
+				volume_envelope_ticks[i] = int((ticks * options.max_envelope_length) / volume_ticks)
 
-		print('/' * 80)
-		print('Too long envelope:', volume_ticks, 'ticks, shrinked to {}'.format(options.max_envelope_length))
-		print('/' * 80)
+			print('/' * 80)
+			print('Too long envelope:', volume_ticks, 'ticks, shrinked to {}'.format(options.max_envelope_length))
+			print('/' * 80)
 
-	# Forward pass: guarantee at least 1 tick between consecutive points
-	for i in range(1, len(volume_envelope_ticks)):
-		if volume_envelope_ticks[i] <= volume_envelope_ticks[i - 1]:
-			volume_envelope_ticks[i] = volume_envelope_ticks[i - 1] + 1
+		# Forward pass: guarantee at least 1 tick between consecutive points
+		for i in range(1, len(volume_envelope_ticks)):
+			if volume_envelope_ticks[i] <= volume_envelope_ticks[i - 1]:
+				volume_envelope_ticks[i] = volume_envelope_ticks[i - 1] + 1
 
-	# Backward pass: if forward pass pushed points beyond the limit, cap and pull back
-	if volume_envelope_ticks and volume_envelope_ticks[-1] > options.max_envelope_length:
-		volume_envelope_ticks[-1] = options.max_envelope_length
-		for i in range(len(volume_envelope_ticks) - 2, -1, -1):
-			if volume_envelope_ticks[i] >= volume_envelope_ticks[i + 1]:
-				volume_envelope_ticks[i] = volume_envelope_ticks[i + 1] - 1
+		# Backward pass: if forward pass pushed points beyond the limit, cap and pull back
+		if volume_envelope_ticks and volume_envelope_ticks[-1] > options.max_envelope_length:
+			volume_envelope_ticks[-1] = options.max_envelope_length
+			for i in range(len(volume_envelope_ticks) - 2, -1, -1):
+				if volume_envelope_ticks[i] >= volume_envelope_ticks[i + 1]:
+					volume_envelope_ticks[i] = volume_envelope_ticks[i + 1] - 1
 
 	# -------------------------------------------------------------- inst header
 
@@ -1021,32 +1078,33 @@ def magic(filename, xi_filename, options):
 		# ------------- NEW LOOP PARSER -------------
 		loop_start = 0
 		loop_length = 0
-		loop_type_flag = 0 
+		loop_type_flag = 0
 
-		if 'loop_start' in region.sfz_params and 'loop_end' in region.sfz_params:
-			try:
-				sfz_loop_start = int(region.sfz_params['loop_start'])
-				sfz_loop_end = int(region.sfz_params['loop_end'])
-				if sfz_loop_end > sfz_loop_start:
-					loop_start = sfz_loop_start
-					loop_length = sfz_loop_end - sfz_loop_start + 1
+		if not options.drumset:
+			if 'loop_start' in region.sfz_params and 'loop_end' in region.sfz_params:
+				try:
+					sfz_loop_start = int(region.sfz_params['loop_start'])
+					sfz_loop_end = int(region.sfz_params['loop_end'])
+					if sfz_loop_end > sfz_loop_start:
+						loop_start = sfz_loop_start
+						loop_length = sfz_loop_end - sfz_loop_start + 1
+						loop_type_flag = SAMPLE_TYPE_FWD_LOOP
+				except ValueError:
+					pass
+
+			if 'loop_mode' in region.sfz_params:
+				mode = region.sfz_params['loop_mode'].lower()
+				if mode in ['no_loop', 'one_shot']:
+					loop_type_flag = 0
+				elif mode in ['loop_continuous', 'loop_sustain']:
 					loop_type_flag = SAMPLE_TYPE_FWD_LOOP
-			except ValueError:
-				pass
+				elif mode == 'ping_pong':
+					loop_type_flag = SAMPLE_TYPE_BIDI_LOOP
 
-		if 'loop_mode' in region.sfz_params:
-			mode = region.sfz_params['loop_mode'].lower()
-			if mode in ['no_loop', 'one_shot']:
+			if loop_length <= 0:
 				loop_type_flag = 0
-			elif mode in ['loop_continuous', 'loop_sustain']:
-				loop_type_flag = SAMPLE_TYPE_FWD_LOOP
-			elif mode == 'ping_pong':
-				loop_type_flag = SAMPLE_TYPE_BIDI_LOOP
-
-		if loop_length <= 0:
-			loop_type_flag = 0
-			loop_start = 0
-			loop_length = 0
+				loop_start = 0
+				loop_length = 0
 
 		# Sample loop start (in bytes)
 		fp.write(struct.pack('<I', loop_start * byte_multiplier))
@@ -1077,8 +1135,13 @@ def magic(filename, xi_filename, options):
 		else:
 			fp.write(struct.pack('<B', 128))
 
-		# Relative Note - transpose c4 ~ 00
-		fp.write(struct.pack('<b', relnote - region.sfz_params['pitch_keycenter']))
+		# Relative Note - transpose c4 ~ 00.
+		# In drumset mode the sample may have been remapped far away from its
+		# original SFZ key, so use the center of the assigned XI range as the
+		# natural key. This keeps the distributed sample from being transposed
+		# just because it was moved to another keyboard zone.
+		pitch_keycenter = region.sfz_params.get('_xi_pitch_keycenter', region.sfz_params['pitch_keycenter'])
+		fp.write(struct.pack('<b', relnote - pitch_keycenter))
 
 		# Sample Name Length
 		fp.write(struct.pack('<B', len(sample_name.rstrip('\0'))))
