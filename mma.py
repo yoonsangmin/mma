@@ -1039,20 +1039,24 @@ def _write_xi_instrument(regions, xi_filename, inst_name, options, start):
 		# 1. Depth: SFZ uses cents (100 cents = 1 semitone).
 		# In FT2, a depth of 16 is roughly 1 semitone. (Ratio: 16 / 100 = 0.16)
 		sfz_depth = float(region.sfz_params.get('pitchlfo_depth', 0))
-		vib_depth = int(sfz_depth * 0.16)
+		vib_depth = round(sfz_depth * 0.16)
+		if sfz_depth > 0:
+			vib_depth = max(1, vib_depth)
 		vib_depth = max(0, min(255, vib_depth))
 
 		# 2. Rate: SFZ uses Hz.
 		# A standard 5Hz vibrato maps to roughly 32 in FT2. (Ratio: 32 / 5 = 6.4)
 		sfz_freq = float(region.sfz_params.get('pitchlfo_freq', 0))
-		vib_rate = int(sfz_freq * 6.4)
+		vib_rate = round(sfz_freq * 6.4)
+		if sfz_freq > 0:
+			vib_rate = max(1, vib_rate)
 		vib_rate = max(0, min(255, vib_rate))
 
 		# 3. Sweep (Fade-in): SFZ uses seconds.
-		# In FT2, smaller sweep values mean slower fade-in. 
+		# In FT2, smaller sweep values mean slower fade-in.
 		# (Rough approximation: 1 second = 40)
 		sfz_fade = float(region.sfz_params.get('pitchlfo_fade', 0))
-		vib_sweep = int(sfz_fade * 40)
+		vib_sweep = round(sfz_fade * 40)
 		vib_sweep = max(0, min(255, vib_sweep))
 
 	# Vibrato type
